@@ -694,12 +694,14 @@ MonoBehaviour:
   m_GameObject: {fileID: 832575517}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 212a0abde411c2d44803431181f4abb2, type: 3}
+  m_Script: {fileID: 11500000, guid: 54421d2f21788e847aedcf85c12b46c6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  portName: COM4
-  baudRate: 115200
-  max: 100
+  espIp: 192.168.4.1
+  espPort: 4210
+  halfPeriodUs: 33333
+  startOn: 1
+  autoStartOnPlay: 1
 --- !u!1 &884565650
 GameObject:
   m_ObjectHideFlags: 0
