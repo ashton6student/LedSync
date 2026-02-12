@@ -1719,6 +1719,8 @@ GameObject:
   - component: {fileID: 1959314908}
   - component: {fileID: 1959314909}
   - component: {fileID: 1959314910}
+  - component: {fileID: 1959314912}
+  - component: {fileID: 1959314911}
   m_Layer: 3
   m_Name: Canvas
   m_TagString: Untagged
@@ -1868,7 +1870,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1959314902}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 6569daa9d0a36bb4f84def9365571ae2, type: 3}
   m_Name: 
@@ -1886,6 +1888,44 @@ MonoBehaviour:
   threshold: 0.05
   pingHz: 0
   showApproxOneWay: 1
+--- !u!114 &1959314911
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1959314902}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f7d3c58b0b2110448b0e9c9796d6499a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  espIp: 192.168.4.1
+  espPort: 4210
+  delayMs: 60
+  safetyMarginMs: 40
+  baseOneWayMs: 20
+  autoPingOnStart: 1
+  pingHz: 0
+  showApproxOneWay: 1
+--- !u!114 &1959314912
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1959314902}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ecd58448c4c32144387ef4750a24dd83, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  led: {fileID: 1959314911}
+  cameraAccess: {fileID: 1609393329}
+  display: {fileID: 585809546}
+  statsText: {fileID: 1736321306}
+  subtractMaterialAsset: {fileID: 2100000, guid: 25a9f3edc3a4de64bbe874e05100370f, type: 2}
+  threshold: 0.05
 --- !u!1 &1964602097
 GameObject:
   m_ObjectHideFlags: 0

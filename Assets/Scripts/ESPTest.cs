@@ -21,13 +21,13 @@ public class ESPTest : MonoBehaviour
     {
         ep = new IPEndPoint(IPAddress.Parse(espIp), espPort);
         udp = new UdpClient();
-        udp.Client.ReceiveTimeout = 500; // 500ms超时
+        udp.Client.ReceiveTimeout = 500; 
     }
 
     void Update()
     {
         if (Time.time < nextPingTime) return;
-        nextPingTime = Time.time + 1f; // 每秒测一次
+        nextPingTime = Time.time + 1f; 
 
         count++;
         byte[] data = Encoding.ASCII.GetBytes("PING");
@@ -47,7 +47,7 @@ public class ESPTest : MonoBehaviour
         }
         catch
         {
-            string msg = $"#{count}  超时!";
+            string msg = $"#{count} ";
             Debug.LogWarning(msg);
             if (resultText) resultText.text = msg;
         }
