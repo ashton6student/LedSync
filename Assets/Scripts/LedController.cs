@@ -1,175 +1,212 @@
+using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using UnityEngine;
+using UnityEngine.InputSystem;
+using System.Diagnostics;
 
 public class LedController : MonoBehaviour
 {
-    [Header("ESP")]
+    [Header("ESP32")]
     public string espIp = "192.168.4.1";
     public int espPort = 4210;
 
-    [Header("Delay Tuning (ms)")]
-    [Tooltip("Derived as baseOneWayMs + safetyMarginMs.")]
-    [Range(10, 500)]
-    public int delayMs = 60;
+    [Header("Input Actions")]
+    public InputActionReference pingButton;
+    public InputActionReference toggleBlinkButton;  // repurpose your old "sendFrequencyButton"
+    public InputActionReference joystick;           // Y changes frequencyHz
 
-    [Range(0, 200)]
-    public int safetyMarginMs = 40;
+    [Header("Blink Frequency (Hz)")]
+    public int frequencyHz = 2;
+    public float adjustSpeed = 5f;   // Hz per second
+    public int minHz = 1;
+    public int maxHz = 120;
 
-    [Tooltip("Computed from average RTT/2 when you re-measure.")]
-    [SerializeField] private float baseOneWayMs = 20f;
+    [Header("Ping")]
+    public int receiveTimeoutMs = 500;
 
-    public bool autoPingOnStart = true;
-
-    [Header("RTT Display / Re-measure")]
-    [Range(0f, 10f)]
-    public float pingHz = 0f; // 0 = disabled
-    public bool showApproxOneWay = true;
-
-    // Public read-only state for UI
     public float LastRttMs => lastRttMs;
     public bool LastPingTimedOut => lastPingTimedOut;
-    public int PingCount => pingCount;
-    public float BaseOneWayMs => baseOneWayMs;
 
-    float nextPingTime;
-    int pingCount;
+    public bool IsBlinking => isBlinking;
+    public bool LedState => ledState;                 // true = ON, false = OFF
+    public float LastToggleTime => lastToggleTime;    // Time.time when we sent last ON/OFF
+
     float lastRttMs = -1f;
     bool lastPingTimedOut = false;
 
     UdpClient udp;
     IPEndPoint ep;
 
+    float frequencyAccumulator;
+
+    bool isBlinking = false;
+    bool ledState = false;
+    float lastToggleTime = -999f;
+    float nextToggleTime = 0f;
+
     void Awake()
     {
         Application.runInBackground = true;
         ep = new IPEndPoint(IPAddress.Parse(espIp), espPort);
         udp = new UdpClient();
-        udp.Client.ReceiveTimeout = 200;
+        udp.Client.ReceiveTimeout = receiveTimeoutMs;
     }
 
-    void Start()
+    void OnEnable()
     {
-        // Ensure delayMs matches current baseline + margin at start
-        RecomputeDelayFromBaseline();
+        pingButton?.action.Enable();
+        toggleBlinkButton?.action.Enable();
+        joystick?.action.Enable();
+    }
 
-        if (autoPingOnStart)
-            MeasureDelay(); // updates baseOneWayMs + delayMs
+    void OnDisable()
+    {
+        pingButton?.action.Disable();
+        toggleBlinkButton?.action.Disable();
+        joystick?.action.Disable();
     }
 
     void Update()
     {
-        // Optional periodic ping for DISPLAY ONLY (does not change delayMs)
-        if (pingHz > 0f && Time.time >= nextPingTime)
-        {
-            nextPingTime = Time.time + (1f / pingHz);
-            PingOnceForDisplay();
-        }
+        HandleJoystick();
+
+        if (pingButton != null && pingButton.action.WasPressedThisFrame())
+            Ping();
+
+        if (toggleBlinkButton != null && toggleBlinkButton.action.WasPressedThisFrame())
+            ToggleBlinking();
+
+        if (isBlinking)
+            BlinkStep();
     }
 
-    // Recompute delayMs whenever safetyMarginMs or baseOneWayMs changes.
-    void RecomputeDelayFromBaseline()
+    void ToggleBlinking()
     {
-        int computed = Mathf.RoundToInt(baseOneWayMs + safetyMarginMs);
-        delayMs = Mathf.Clamp(computed, 10, 500);
-    }
+        isBlinking = !isBlinking;
 
-    // Measures multiple pings, updates baseOneWayMs from avg RTT/2, then recomputes delayMs.
-    public void MeasureDelay()
-    {
-        float totalRtt = 0;
-        int success = 0;
-        byte[] ping = Encoding.ASCII.GetBytes("PING");
-
-        for (int i = 0; i < 5; i++)
+        if (isBlinking)
         {
-            try
-            {
-                float t0 = Time.realtimeSinceStartup;
-                udp.Send(ping, ping.Length, ep);
-
-                IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
-                _ = udp.Receive(ref any);
-
-                float rtt = (Time.realtimeSinceStartup - t0) * 1000f;
-                totalRtt += rtt;
-                success++;
-
-                lastRttMs = rtt;
-                lastPingTimedOut = false;
-                Debug.Log($"[LedController] Ping {i + 1}: {rtt:F1}ms");
-            }
-            catch
-            {
-                lastPingTimedOut = true;
-                Debug.LogWarning($"[LedController] Ping {i + 1}: timeout");
-            }
-        }
-
-        if (success > 0)
-        {
-            float avgRtt = totalRtt / success;
-            lastRttMs = avgRtt;
-            lastPingTimedOut = false;
-
-            baseOneWayMs = avgRtt / 2f;
-            RecomputeDelayFromBaseline();
-
-            Debug.Log($"[LedController] Avg RTT={avgRtt:F1}ms -> baseOneWayMs={baseOneWayMs:F1}ms -> delayMs={delayMs}");
+            // start from OFF -> immediately toggle to ON at next BlinkStep
+            ledState = false;
+            nextToggleTime = Time.time;  // toggle immediately
         }
         else
         {
-            Debug.LogWarning("[LedController] Ping failed; keeping existing delayMs=" + delayMs);
+            // stop blinking and force OFF
+            SendLed(false);
         }
+
+        UnityEngine.Debug.Log(isBlinking ? "[LedController] Blinking ON" : "[LedController] Blinking OFF");
     }
 
-    void PingOnceForDisplay()
+    void BlinkStep()
     {
-        pingCount++;
-        byte[] ping = Encoding.ASCII.GetBytes("PING");
+        float hz = Mathf.Clamp(frequencyHz, minHz, maxHz);
+        float halfPeriod = 0.5f / hz;
 
-        try
+        if (Time.time < nextToggleTime)
+            return;
+
+        // toggle state and send it
+        ledState = !ledState;
+        SendLed(ledState);
+
+        lastToggleTime = Time.time;
+        nextToggleTime = Time.time + halfPeriod;
+    }
+
+    void HandleJoystick()
+    {
+        if (joystick == null) return;
+
+        Vector2 stick = joystick.action.ReadValue<Vector2>();
+
+        const float deadzone = 0.2f;
+        if (Mathf.Abs(stick.y) < deadzone) return;
+
+        frequencyAccumulator += stick.y * adjustSpeed * Time.deltaTime;
+
+        if (Mathf.Abs(frequencyAccumulator) >= 1f)
         {
-            float t0 = Time.realtimeSinceStartup;
-            udp.Send(ping, ping.Length, ep);
+            int delta = (int)frequencyAccumulator; // trunc toward 0
+            frequencyAccumulator -= delta;
 
-            IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
-            _ = udp.Receive(ref any);
-
-            float rtt = (Time.realtimeSinceStartup - t0) * 1000f;
-            lastRttMs = rtt;
-            lastPingTimedOut = false;
-        }
-        catch
-        {
-            lastPingTimedOut = true;
+            frequencyHz = Mathf.Clamp(frequencyHz + delta, minHz, maxHz);
+            UnityEngine.Debug.Log($"[LedController] Frequency: {frequencyHz} Hz");
         }
     }
 
     public void SendLed(bool on)
     {
-        byte[] data = Encoding.ASCII.GetBytes(on ? "ON" : "OFF");
-        udp.Send(data, data.Length, ep);
-        udp.Send(data, data.Length, ep);
+        SendAscii(on ? "ON" : "OFF");
     }
 
-    // Public method UI can call on button press
-    public void RemeasureDelay()
+    public void Ping()
     {
-        MeasureDelay();
+        FlushSocket();
+
+        try
+        {
+            byte[] ping = Encoding.ASCII.GetBytes("PING");
+
+            var sw = Stopwatch.StartNew();
+            udp.Send(ping, ping.Length, ep);
+
+            IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+            byte[] resp = udp.Receive(ref from);
+            sw.Stop();
+
+            string text = Encoding.ASCII.GetString(resp).Trim();
+            if (text == "PONG")
+            {
+                lastRttMs = (float)sw.Elapsed.TotalMilliseconds;
+                lastPingTimedOut = false;
+                UnityEngine.Debug.Log($"[LedController] RTT: {lastRttMs:F1} ms");
+            }
+        }
+        catch
+        {
+            lastPingTimedOut = true;
+            UnityEngine.Debug.LogWarning("[LedController] Ping timeout");
+        }
     }
 
-    // Public method UI can call when safetyMargin changes
-    public void SetSafetyMarginMs(int newMargin)
+    void SendAscii(string msg)
     {
-        safetyMarginMs = Mathf.Clamp(newMargin, 0, 200);
-        RecomputeDelayFromBaseline();
+        if (udp == null) return;
+
+        byte[] data = Encoding.ASCII.GetBytes(msg);
+        try
+        {
+            udp.Send(data, data.Length, ep);
+        }
+        catch (Exception ex)
+        {
+            UnityEngine.Debug.LogError($"[LedController] UDP send error ({msg}): {ex}");
+        }
+    }
+
+    void FlushSocket()
+    {
+        if (udp == null) return;
+
+        try
+        {
+            while (udp.Available > 0)
+            {
+                IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                udp.Receive(ref from);
+            }
+        }
+        catch { }
     }
 
     void OnDestroy()
     {
         try { SendLed(false); } catch { }
         udp?.Close();
+        udp = null;
     }
 }

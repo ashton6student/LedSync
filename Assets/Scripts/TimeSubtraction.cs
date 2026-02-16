@@ -1,162 +1,220 @@
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 using Meta.XR;
-using TMPro;
 
 public class TimeSubtraction : MonoBehaviour
 {
-    [Header("LED Controller Reference")]
-    public LedController led;
-
     [Header("Passthrough")]
     public PassthroughCameraAccess cameraAccess;
 
-    [Header("Display (Result Texture)")]
+    [Header("Output")]
     public RawImage display;
 
-    [Header("UI Text (Stats)")]
-    public TextMeshProUGUI statsText;
+    [Header("Materials (assets)")]
+    public Material materialA;
+    public Material materialB;
 
-    [Header("Subtract Material")]
-    public Material subtractMaterialAsset;
+    [Header("Input Actions")]
+    public InputActionReference toggleButton;
+    public InputActionReference joystick; // Y: phaseComp, X: threshold
 
-    [Header("Mask Threshold")]
+    [Header("LED Controller")]
+    public LedController led;
+
+    [Header("Phase Alignment (ms)")]
+    [Range(0f, 200f)]
+    public float phaseCompensationMs = 40f;
+
+    [Range(1f, 500f)]
+    public float phaseAdjustRate = 80f;
+
+    [Header("Threshold")]
+    [Range(0f, 0.3f)]
+    public float subtractionThreshold = 0.05f;
+
+    [Range(0.01f, 1f)]
+    public float thresholdAdjustRate = 0.08f;
+
     [Range(0f, 0.5f)]
-    public float threshold = 0.05f;
+    public float deadzone = 0.2f;
 
-    enum Phase { SendOn, WaitOn, CaptureOn, SendOff, WaitOff, CaptureOff }
-    Phase phase;
-    float timer;
-    float delaySeconds;
+    enum DisplayMode { Raw = 0, MatA = 1, MatB = 2 }
+    DisplayMode mode = DisplayMode.Raw;
+    public int CurrentModeIndex => (int)mode;
+
+    // Runtime instances (avoid mutating shared asset materials)
+    Material matAInst;
+    Material matBInst;
 
     RenderTexture onRT;
     RenderTexture offRT;
-    RenderTexture outputRT;
-    Material subtractMat;
+    RenderTexture outRT;
+
     bool initialized;
+    bool haveOn;
+    bool haveOff;
+
+    int lastW = -1;
+    int lastH = -1;
+
+    float lastSeenToggleTime = -999f;
+    bool lastSeenLedState = false;
+    bool capturedForThisEdge = false;
 
     static readonly int PrevTexId = Shader.PropertyToID("_PrevTex");
     static readonly int ThresholdId = Shader.PropertyToID("_Threshold");
 
-    void Start()
+    void Awake()
     {
-        if (!led || !cameraAccess || !display || !subtractMaterialAsset)
-        {
-            Debug.LogError("[TimeSubtraction] Inspector references missing (led, cameraAccess, display, subtractMaterialAsset).");
-            enabled = false;
-            return;
-        }
+        Application.runInBackground = true;
 
-        subtractMat = new Material(subtractMaterialAsset);
-        display.material = null;
+        if (materialA) matAInst = new Material(materialA);
+        if (materialB) matBInst = new Material(materialB);
+    }
 
-        delaySeconds = led.delayMs / 1000f;
-        phase = Phase.SendOn;
+    void OnEnable()
+    {
+        toggleButton?.action.Enable();
+        joystick?.action.Enable();
+    }
 
-        UpdateStatsText();
+    void OnDisable()
+    {
+        toggleButton?.action.Disable();
+        joystick?.action.Disable();
     }
 
     void Update()
     {
+        if (!cameraAccess || !display) return;
         if (!cameraAccess.IsPlaying) return;
 
         Texture src = cameraAccess.GetTexture();
         if (src == null) return;
 
-        if (!initialized)
+        // Handle passthrough resolution changes safely
+        if (!initialized || src.width != lastW || src.height != lastH)
         {
             if (src.width < 32 || src.height < 32) return;
-            InitRTs(src.width, src.height);
+
+            lastW = src.width;
+            lastH = src.height;
+
+            InitRTs(lastW, lastH);
             initialized = true;
+
+            // Reset capture state on resize
+            haveOn = false;
+            haveOff = false;
+            capturedForThisEdge = false;
         }
 
-        delaySeconds = led.delayMs / 1000f;
+        HandleInputs();
+        CaptureIfDue(src);
+        Render(src);
+    }
 
-        switch (phase)
+    void HandleInputs()
+    {
+        if (toggleButton != null && toggleButton.action.WasPressedThisFrame())
+            mode = (DisplayMode)(((int)mode + 1) % 3);
+
+        if (joystick == null) return;
+
+        Vector2 stick = joystick.action.ReadValue<Vector2>();
+
+        if (Mathf.Abs(stick.y) >= deadzone)
         {
-            case Phase.SendOn:
-                led.SendLed(true);
-                timer = 0f;
-                phase = Phase.WaitOn;
+            phaseCompensationMs += stick.y * phaseAdjustRate * Time.deltaTime;
+            phaseCompensationMs = Mathf.Clamp(phaseCompensationMs, 0f, 200f);
+        }
+
+        if (Mathf.Abs(stick.x) >= deadzone)
+        {
+            subtractionThreshold += stick.x * thresholdAdjustRate * Time.deltaTime;
+            subtractionThreshold = Mathf.Clamp(subtractionThreshold, 0f, 0.3f);
+        }
+    }
+
+    void CaptureIfDue(Texture src)
+    {
+        if (led == null) return;
+        if (!led.IsBlinking) return;
+
+        // Detect a new edge (new ON/OFF command sent)
+        if (Mathf.Abs(led.LastToggleTime - lastSeenToggleTime) > 0.0001f || led.LedState != lastSeenLedState)
+        {
+            lastSeenToggleTime = led.LastToggleTime;
+            lastSeenLedState = led.LedState;
+            capturedForThisEdge = false;
+        }
+
+        if (capturedForThisEdge) return;
+
+        float oneWayMs = (!led.LastPingTimedOut && led.LastRttMs >= 0f) ? (led.LastRttMs * 0.5f) : 0f;
+        float captureAt = lastSeenToggleTime + (oneWayMs + phaseCompensationMs) / 1000f;
+
+        if (Time.time < captureAt) return;
+
+        // Capture the frame corresponding to the LED state *after the edge*
+        if (lastSeenLedState)
+        {
+            if (onRT != null) Graphics.Blit(src, onRT);
+            haveOn = true;
+        }
+        else
+        {
+            if (offRT != null) Graphics.Blit(src, offRT);
+            haveOff = true;
+        }
+
+        capturedForThisEdge = true;
+    }
+
+    void Render(Texture src)
+    {
+        // Always let Raw mode show the live passthrough immediately
+        if (mode == DisplayMode.Raw)
+        {
+            display.texture = src;
+            return;
+        }
+
+        // Only process if we actually have a valid pair and RTs exist
+        bool havePair = haveOn && haveOff && onRT != null && offRT != null && outRT != null;
+
+        if (!havePair)
+        {
+            // Avoid running shaders with missing textures; prevents "stuck last frame" behavior
+            display.texture = src;
+            return;
+        }
+
+        switch (mode)
+        {
+            case DisplayMode.MatA:
+                if (!matAInst) { display.texture = src; return; }
+                RenderProcessed(matAInst);
                 break;
 
-            case Phase.WaitOn:
-                timer += Time.deltaTime;
-                if (timer >= delaySeconds)
-                    phase = Phase.CaptureOn;
-                break;
-
-            case Phase.CaptureOn:
-                Graphics.Blit(src, onRT);
-                phase = Phase.SendOff;
-                break;
-
-            case Phase.SendOff:
-                led.SendLed(false);
-                timer = 0f;
-                phase = Phase.WaitOff;
-                break;
-
-            case Phase.WaitOff:
-                timer += Time.deltaTime;
-                if (timer >= delaySeconds)
-                    phase = Phase.CaptureOff;
-                break;
-
-            case Phase.CaptureOff:
-                Graphics.Blit(src, offRT);
-                subtractMat.SetTexture(PrevTexId, offRT);
-                subtractMat.SetFloat(ThresholdId, threshold);
-                Graphics.Blit(onRT, outputRT, subtractMat);
-                display.texture = outputRT;
-                phase = Phase.SendOn;
-                UpdateStatsText();
+            case DisplayMode.MatB:
+                if (!matBInst) { display.texture = src; return; }
+                RenderProcessed(matBInst);
                 break;
         }
     }
 
-    void UpdateStatsText()
+    void RenderProcessed(Material matInst)
     {
-        if (!statsText || !led) return;
+        // Shaders expect:
+        // _MainTex = ON frame (input to Blit)
+        // _PrevTex = OFF frame
+        matInst.SetTexture(PrevTexId, offRT);
+        matInst.SetFloat(ThresholdId, subtractionThreshold);
 
-        int pingCount = led.PingCount;
-        float lastRttMs = led.LastRttMs;
-        bool timedOut = led.LastPingTimedOut;
-
-        string rttLine;
-        if (timedOut)
-            rttLine = $"#{pingCount}  RTT: timeout";
-        else if (lastRttMs >= 0f)
-            rttLine = led.showApproxOneWay
-                ? $"#{pingCount}  RTT: {lastRttMs:F1} ms  ≈ {lastRttMs / 2f:F1} ms"
-                : $"#{pingCount}  RTT: {lastRttMs:F1} ms";
-        else
-            rttLine = $"#{pingCount}  RTT: (not measured)";
-
-        string baseLine = $"baseOneWayMs: {led.BaseOneWayMs:F1} ms";
-        string timingLine = $"delayMs: {led.delayMs} ms   safetyMarginMs: {led.safetyMarginMs} ms";
-
-        statsText.text = $"{rttLine}\n{baseLine}\n{timingLine}";
-    }
-
-    // Public method UI can call on button press (delegates to LedController)
-    public void RemeasureDelay()
-    {
-        led.RemeasureDelay();
-        UpdateStatsText();
-    }
-
-    // Public method UI can call when safetyMargin changes (delegates to LedController)
-    public void SetSafetyMarginMs(int newMargin)
-    {
-        led.SetSafetyMarginMs(newMargin);
-        UpdateStatsText();
-    }
-
-    void OnDestroy()
-    {
-        ReleaseRTs();
-        if (subtractMat != null) Destroy(subtractMat);
+        Graphics.Blit(onRT, outRT, matInst);
+        display.texture = outRT;
     }
 
     void InitRTs(int w, int h)
@@ -164,7 +222,7 @@ public class TimeSubtraction : MonoBehaviour
         ReleaseRTs();
         onRT = MakeRT(w, h);
         offRT = MakeRT(w, h);
-        outputRT = MakeRT(w, h);
+        outRT = MakeRT(w, h);
     }
 
     RenderTexture MakeRT(int w, int h)
@@ -182,11 +240,26 @@ public class TimeSubtraction : MonoBehaviour
     {
         void Release(ref RenderTexture rt)
         {
-            if (rt != null) { rt.Release(); Destroy(rt); rt = null; }
+            if (rt != null)
+            {
+                rt.Release();
+                Destroy(rt);
+                rt = null;
+            }
         }
+
         Release(ref onRT);
         Release(ref offRT);
-        Release(ref outputRT);
+        Release(ref outRT);
+
         initialized = false;
+    }
+
+    void OnDestroy()
+    {
+        ReleaseRTs();
+
+        if (matAInst != null) Destroy(matAInst);
+        if (matBInst != null) Destroy(matBInst);
     }
 }
